@@ -1,0 +1,209 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Remote Share — Controller</title>
+<link rel="stylesheet" href="/style.css">
+<div id="wrap">
+  <div class="bar">
+    <input id="code" placeholder="6-digit code" maxlength="6" size="8" inputmode="numeric">
+    <label><input type="checkbox" id="direct"> direct only (no TURN)</label>
+    <button id="connect">Connect</button>
+    <button id="disconnect" disabled>Disconnect</button>
+    <label><input type="checkbox" id="cmdctrl" checked> ⌘ → Ctrl</label>
+    <button id="capture" disabled>Capture keyboard</button>
+    <button id="fs">Fullscreen</button>
+    <button id="mute">Mute</button>
+    <input id="vol" type="range" min="0" max="1" step="0.05" value="1" style="width:80px">
+    <span id="status"></span>
+  </div>
+  <div class="stats" id="stats">not connected</div>
+  <div id="stage" tabindex="0"><video id="video" autoplay playsinline></video></div>
+</div>
+<script type="module">
+import { PROTOCOL_VERSION as V, signaling, iceConfig, connectionInfo, formatInfo } from '/common.js';
+
+const $ = id => document.getElementById(id);
+const video = $('video'), stage = $('stage');
+let sig, pc, input, move, statsTimer, seq = 0, captured = false, lastCode, wantConnected = false;
+const pressedKeys = new Set(), pressedButtons = new Set();
+
+const status = (t, err) => { $('status').textContent = t; $('status').className = err ? 'err' : ''; };
+const sendInput = m => input?.readyState === 'open' && input.send(JSON.stringify({ v: V, ...m }));
+
+$('connect').onclick = () => { lastCode = $('code').value.trim(); wantConnected = true; connect(); };
+$('disconnect').onclick = () => { wantConnected = false; sig?.send({ type: 'bye' }); teardown('Disconnected'); };
+
+function connect() {
+  teardown();
+  status('Waiting for approval on Source…');
+  sig = signaling(onSignal);
+  sig.send({ type: 'join', code: lastCode, directOnly: $('direct').checked });
+  $('connect').disabled = true; $('disconnect').disabled = false;
+}
+
+function teardown(reason) {
+  releaseAll();
+  clearInterval(statsTimer);
+  pc?.close(); sig?.ws.close();
+  pc = sig = input = move = null;
+  setCapture(false);
+  $('capture').disabled = true;
+  $('connect').disabled = false; $('disconnect').disabled = true;
+  if (reason) status(reason, /fail|invalid|reject|many|lost/i.test(reason));
+}
+
+function scheduleReconnect(reason) {
+  teardown(reason + ' — reconnecting in 3 s (Source must approve again)');
+  setTimeout(() => wantConnected && !pc && connect(), 3000);
+}
+
+async function onSignal(m) {
+  if (m.type === 'error') { wantConnected = false; return teardown(m.error); }
+  if (m.type === 'bye') return wantConnected ? scheduleReconnect('Source ended the session') : teardown('Source ended the session');
+  if (m.type === 'offer') {
+    const directOnly = $('direct').checked;
+    pc = new RTCPeerConnection(await iceConfig({ directOnly }));
+    pc.onicecandidate = e => sig.send({ type: 'candidate', candidate: e.candidate });
+    pc.ontrack = e => {
+      if ('jitterBufferTarget' in e.receiver) e.receiver.jitterBufferTarget = 0;
+      if ('playoutDelayHint' in e.receiver) e.receiver.playoutDelayHint = 0;
+      video.srcObject = e.streams[0];
+      applyAudio();
+    };
+    pc.ondatachannel = e => {
+      if (e.channel.label === 'input') { input = e.channel; input.onmessage = onControlMsg; }
+      if (e.channel.label === 'move') move = e.channel;
+    };
+    pc.onconnectionstatechange = () => {
+      const s = pc.connectionState;
+      status('Peer: ' + s);
+      if (s === 'connected') { $('capture').disabled = false; stage.focus(); }
+      if (s === 'disconnected') releaseAll();
+      if (s === 'failed') {
+        if (directOnly) { wantConnected = false; teardown('Direct P2P connection failed. Relay (TURN) is disabled in "direct only" mode — your networks probably block UDP hole punching (symmetric NAT / firewall).'); }
+        else scheduleReconnect('Connection failed/lost');
+      }
+    };
+    await pc.setRemoteDescription(m.sdp);
+    await pc.setLocalDescription(await pc.createAnswer());
+    sig.send({ type: 'answer', sdp: pc.localDescription });
+    let prev = {};
+    statsTimer = setInterval(async () => {
+      if (!pc) return;
+      prev = await connectionInfo(pc, prev);
+      $('stats').textContent = formatInfo(prev);
+    }, 1000);
+  }
+  if (m.type === 'candidate' && m.candidate) await pc?.addIceCandidate(m.candidate).catch(() => {});
+}
+
+function onControlMsg(e) {
+  const m = JSON.parse(e.data);
+  if (m.t === 'hello') {
+    if (m.v !== V) status(`Protocol mismatch: source v${m.v}, controller v${V}`, true);
+    else if (!m.agent) status('Connected (view only — input agent not running on Source)', true);
+  }
+}
+
+function applyAudio() { video.volume = +$('vol').value; video.muted = $('mute').dataset.on === '1'; }
+$('vol').oninput = applyAudio;
+$('mute').onclick = () => { const on = $('mute').dataset.on !== '1'; $('mute').dataset.on = on ? '1' : '0'; $('mute').textContent = on ? 'Unmute' : 'Mute'; applyAudio(); };
+
+$('fs').onclick = () => document.fullscreenElement ? document.exitFullscreen() : stage.requestFullscreen();
+
+function videoPoint(e) {
+  const r = video.getBoundingClientRect();
+  const vw = video.videoWidth, vh = video.videoHeight;
+  if (!vw) return null;
+  const scale = Math.min(r.width / vw, r.height / vh);
+  const dw = vw * scale, dh = vh * scale;
+  const x = (e.clientX - r.left - (r.width - dw) / 2) / dw;
+  const y = (e.clientY - r.top - (r.height - dh) / 2) / dh;
+  if (x < 0 || y < 0 || x > 1 || y > 1) return null;
+  return { x, y };
+}
+
+let pendingMove = null;
+video.addEventListener('pointermove', e => {
+  const p = videoPoint(e);
+  if (!p) return;
+  if (!pendingMove) requestAnimationFrame(() => {
+    if (move?.readyState === 'open') move.send(JSON.stringify({ v: V, t: 'move', seq: seq++, ...pendingMove }));
+    pendingMove = null;
+  });
+  pendingMove = p;
+});
+const BTN = ['left', 'middle', 'right'];
+video.addEventListener('pointerdown', e => {
+  stage.focus();
+  const p = videoPoint(e); if (!p) return;
+  const b = BTN[e.button]; if (!b) return;
+  pressedButtons.add(b);
+  sendInput({ t: 'button', b, down: true, ...p });
+  e.preventDefault();
+});
+window.addEventListener('pointerup', e => {
+  const b = BTN[e.button]; if (!b || !pressedButtons.has(b)) return;
+  pressedButtons.delete(b);
+  sendInput({ t: 'button', b, down: false, ...(videoPoint(e) || {}) });
+});
+video.addEventListener('contextmenu', e => e.preventDefault());
+video.addEventListener('wheel', e => {
+  e.preventDefault();
+  const k = e.deltaMode === 1 ? 1 : e.deltaMode === 2 ? 10 : 1 / 40;
+  sendInput({ t: 'wheel', dx: e.deltaX * k, dy: e.deltaY * k });
+}, { passive: false });
+
+function mapCode(code) {
+  if ($('cmdctrl').checked) {
+    if (code === 'MetaLeft') return 'ControlLeft';
+    if (code === 'MetaRight') return 'ControlRight';
+  }
+  return code;
+}
+
+const isExitShortcut = e => e.code === 'Escape' && e.ctrlKey && e.altKey;
+
+stage.addEventListener('keydown', e => {
+  if (isExitShortcut(e)) { setCapture(false); releaseAll(); e.preventDefault(); return; }
+  if (!captured && e.metaKey && !['MetaLeft', 'MetaRight'].includes(e.code)) return;
+  e.preventDefault();
+  const code = mapCode(e.code);
+  if (e.repeat && pressedKeys.has(code)) return sendInput({ t: 'key', code, key: e.key, down: true, repeat: true });
+  pressedKeys.add(code);
+  sendInput({ t: 'key', code, key: e.key, down: true });
+});
+stage.addEventListener('keyup', e => {
+  const code = mapCode(e.code);
+  if (!pressedKeys.has(code)) return;
+  e.preventDefault();
+  pressedKeys.delete(code);
+  sendInput({ t: 'key', code, key: e.key, down: false });
+  if (e.code.startsWith('Meta')) releaseAll();
+});
+
+function releaseAll() {
+  for (const code of pressedKeys) sendInput({ t: 'key', code, down: false });
+  for (const b of pressedButtons) sendInput({ t: 'button', b, down: false });
+  pressedKeys.clear(); pressedButtons.clear();
+  sendInput({ t: 'release-all' });
+}
+stage.addEventListener('blur', releaseAll);
+window.addEventListener('blur', releaseAll);
+document.addEventListener('visibilitychange', () => document.hidden && releaseAll());
+window.addEventListener('beforeunload', releaseAll);
+
+async function setCapture(on) {
+  captured = on;
+  stage.classList.toggle('captured', on);
+  $('capture').textContent = on ? 'Release keyboard (Ctrl+Alt+Esc)' : 'Capture keyboard';
+  if (on) {
+    if (!document.fullscreenElement) await stage.requestFullscreen().catch(() => {});
+    await navigator.keyboard?.lock?.().catch(() => {});
+    stage.focus();
+  } else {
+    navigator.keyboard?.unlock?.();
+  }
+}
+$('capture').onclick = () => setCapture(!captured);
+document.addEventListener('fullscreenchange', () => { if (!document.fullscreenElement && captured) setCapture(false); });
+</script>

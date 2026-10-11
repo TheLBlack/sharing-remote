@@ -1,0 +1,157 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Remote Share — Source</title>
+<link rel="stylesheet" href="/style.css">
+<div id="live" class="live" hidden>● SHARING SCREEN — remote control active <button id="kill">Disconnect now</button></div>
+<main>
+  <h1>Source</h1>
+  <p>Input agent: <span id="agentState">not connected</span>
+    (run <code>python3 agent/agent.py</code> on this machine; without it only view is possible)</p>
+  <label><input type="checkbox" id="audio" checked> share system audio</label>
+  <p><button id="start">Choose screen &amp; start</button> <button id="stop" disabled>Stop sharing</button></p>
+  <div id="pair" hidden>Pairing code (valid 5 min, single use): <div class="code" id="code"></div></div>
+  <p id="status"></p>
+  <div class="stats" id="stats"></div>
+</main>
+<dialog id="approve">
+  <p>Controller from <b id="from"></b> wants to view and control this screen.</p>
+  <button id="yes">Allow</button> <button id="no">Deny</button>
+</dialog>
+<script type="module">
+import { PROTOCOL_VERSION, signaling, iceConfig, connectionInfo, formatInfo } from '/common.js';
+
+const $ = id => document.getElementById(id);
+const AGENT_URL = new URLSearchParams(location.search).get('agent') || 'ws://127.0.0.1:8765';
+let stream, sig, pc, agent, statsTimer, dims = { w: 0, h: 0 };
+
+function connectAgent() {
+  agent = new WebSocket(AGENT_URL);
+  agent.onopen = () => $('agentState').textContent = 'connected';
+  agent.onclose = () => { $('agentState').textContent = 'not connected (retrying)'; setTimeout(connectAgent, 2000); };
+  agent.onmessage = e => {
+    const m = JSON.parse(e.data);
+    if (m.t === 'error') $('status').textContent = 'Agent: ' + m.error;
+  };
+}
+const toAgent = m => agent?.readyState === 1 && agent.send(JSON.stringify(m));
+connectAgent();
+
+$('start').onclick = async () => {
+  try {
+    stream = await navigator.mediaDevices.getDisplayMedia({
+      video: { frameRate: { ideal: 60 }, displaySurface: 'monitor' },
+      audio: $('audio').checked ? { suppressLocalAudioPlayback: false, echoCancellation: false, noiseSuppression: false, autoGainControl: false } : false,
+      systemAudio: 'include',
+      selfBrowserSurface: 'exclude',
+      monitorTypeSurfaces: 'include',
+    });
+  } catch (e) {
+    $('status').innerHTML = `<span class="err">Screen capture denied or unavailable: ${e.message}. On macOS grant your browser Screen Recording in System Settings → Privacy &amp; Security, then restart it.</span>`;
+    return;
+  }
+  const v = stream.getVideoTracks()[0];
+  v.contentHint = 'detail';
+  const s = v.getSettings();
+  if (s.displaySurface && s.displaySurface !== 'monitor') $('status').textContent = 'Warning: you shared a window/tab — mouse mapping assumes a whole screen.';
+  if (!stream.getAudioTracks().length && $('audio').checked) $('status').textContent += ' System audio not available for this surface/browser.';
+  v.onended = stop;
+  $('start').disabled = true; $('stop').disabled = false;
+  sig = signaling(onSignal);
+  sig.send({ type: 'host', v: PROTOCOL_VERSION });
+};
+
+$('stop').onclick = stop;
+$('kill').onclick = () => { sig?.send({ type: 'bye' }); closePeer('Disconnected locally'); };
+
+function stop() {
+  closePeer('Stopped');
+  stream?.getTracks().forEach(t => t.stop());
+  sig?.ws.close();
+  stream = sig = null;
+  $('pair').hidden = true;
+  $('start').disabled = false; $('stop').disabled = true;
+}
+
+function closePeer(reason) {
+  toAgent({ v: PROTOCOL_VERSION, t: 'release-all' });
+  clearInterval(statsTimer);
+  pc?.close();
+  pc = null;
+  $('live').hidden = true;
+  $('stats').textContent = '';
+  if (reason) $('status').textContent = reason;
+}
+
+async function onSignal(m) {
+  if (m.type === 'code') { $('code').textContent = m.code; $('pair').hidden = false; }
+  if (m.type === 'expired') { $('status').textContent = 'Code expired.'; stop(); }
+  if (m.type === 'join-request') {
+    $('from').textContent = m.from;
+    $('approve').showModal();
+    $('yes').onclick = () => { $('approve').close(); startPeer(m.directOnly); };
+    $('no').onclick = () => { $('approve').close(); sig.send({ type: 'reject' }); };
+  }
+  if (m.type === 'answer') await pc?.setRemoteDescription(m.sdp);
+  if (m.type === 'candidate' && m.candidate) await pc?.addIceCandidate(m.candidate).catch(() => {});
+  if (m.type === 'bye') closePeer('Controller disconnected — waiting for reconnect with the same code');
+}
+
+async function startPeer(directOnly) {
+  closePeer();
+  pc = new RTCPeerConnection(await iceConfig({ directOnly }));
+  pc.onicecandidate = e => sig.send({ type: 'candidate', candidate: e.candidate });
+  pc.onconnectionstatechange = () => {
+    $('status').textContent = 'Peer: ' + pc.connectionState;
+    if (pc.connectionState === 'connected') $('live').hidden = false;
+    if (['failed', 'closed', 'disconnected'].includes(pc.connectionState)) toAgent({ v: PROTOCOL_VERSION, t: 'release-all' });
+    if (pc.connectionState === 'failed') closePeer(directOnly ? 'Direct P2P failed (relay disabled).' : 'Connection failed.');
+  };
+
+  for (const t of stream.getTracks()) {
+    const sender = pc.addTrack(t, stream);
+    if (t.kind === 'video') {
+      const p = sender.getParameters();
+      p.degradationPreference = 'maintain-resolution';
+      p.encodings = [{ ...(p.encodings?.[0] || {}), maxBitrate: 12_000_000, maxFramerate: 60 }];
+      sender.setParameters(p).catch(() => {});
+    }
+  }
+
+  const input = pc.createDataChannel('input', { ordered: true });
+  const move = pc.createDataChannel('move', { ordered: false, maxRetransmits: 0 });
+  const vs = stream.getVideoTracks()[0].getSettings();
+  dims = { w: vs.width, h: vs.height };
+  input.onopen = () => input.send(JSON.stringify({ v: PROTOCOL_VERSION, t: 'hello', w: dims.w, h: dims.h, agent: agent?.readyState === 1 }));
+  input.onclose = () => toAgent({ v: PROTOCOL_VERSION, t: 'release-all' });
+  const forward = e => {
+    let m;
+    try { m = JSON.parse(e.data); } catch { return; }
+    if (m.v !== PROTOCOL_VERSION) return;
+    toAgent(m);
+  };
+  input.onmessage = forward;
+  let lastSeq = -1;
+  move.onmessage = e => {
+    const m = JSON.parse(e.data);
+    if (m.seq <= lastSeq) return;
+    lastSeq = m.seq;
+    forward(e);
+  };
+
+  const offer = await pc.createOffer();
+  await pc.setLocalDescription(offer);
+  sig.send({ type: 'offer', sdp: pc.localDescription });
+
+  let prev = {};
+  statsTimer = setInterval(async () => {
+    if (!pc) return;
+    prev = await connectionInfo(pc, prev);
+    $('stats').textContent = formatInfo(prev);
+    const s = stream.getVideoTracks()[0].getSettings();
+    if (s.width !== dims.w || s.height !== dims.h) {
+      dims = { w: s.width, h: s.height };
+      if (input.readyState === 'open') input.send(JSON.stringify({ v: PROTOCOL_VERSION, t: 'resize', w: dims.w, h: dims.h }));
+    }
+  }, 1000);
+}
+</script>
